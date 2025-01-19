@@ -1,0 +1,7 @@
+env
+.env
+
+.vscode
+.idea
+
+session_data

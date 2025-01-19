@@ -1,0 +1,15 @@
+[server]
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+enableWebsocketCompression = true
+# cookieSecret = <Set in env var>
+
+[client]
+toolbarMode = "developer"
+
+[logger]
+level = "warning"
+
+[browser]
+gatherUsageStats = false

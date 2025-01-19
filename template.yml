@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::LanguageExtensions
+Description: CloudFormation template with ALB, ECS Cluster, ECS Service, VPC, Subnets, and EFS with Access Point
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the ECS Cluster
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public Subnet IDs for the ECS Cluster
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private Subnet IDs for the ECS Cluster
+  StreamlitServerCookieSecret:
+    Type: String
+    Description: Secret key for Streamlit server
+    NoEcho: true
+  CreateCloudFrontDistribution:
+    Type: String
+    Description: Create a CloudFront distribution in front of the ALB
+    Default: 'False'
+    AllowedValues:
+      - 'True'
+      - 'False'
+
+Conditions:
+  CreateDistruibution: !Equals [!Ref CreateCloudFrontDistribution, 'True']
+
+Mappings:
+  AWSRegions2PrefixListID:
+    ap-northeast-1:
+      PrefixList: pl-58a04531
+    ap-northeast-2:
+      PrefixList: pl-22a6434b
+    ap-south-1:
+      PrefixList: pl-9aa247f3
+    ap-southeast-1:
+      PrefixList: pl-31a34658
+    ap-southeast-2:
+      PrefixList: pl-b8a742d1
+    ca-central-1:
+      PrefixList: pl-38a64351
+    eu-central-1:
+      PrefixList: pl-a3a144ca
+    eu-north-1:
+      PrefixList: pl-fab65393
+    eu-west-1:
+      PrefixList: pl-4fa04526
+    eu-west-2:
+      PrefixList: pl-93a247fa
+    eu-west-3:
+      PrefixList: pl-75b1541c
+    sa-east-1:
+      PrefixList: pl-5da64334
+    us-east-1:
+      PrefixList: pl-3b927c52
+    us-east-2:
+      PrefixList: pl-b6a144df
+    us-west-1:
+      PrefixList: pl-4ea04527
+    us-west-2:
+      PrefixList: pl-82a045eb
+
+Resources:
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: streamlit-chatbot-cluster
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: streamlit-chatbot
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bedrock
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+        - PolicyName: ECSExec
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECRPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECR
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource:
+                  - "*"
+        - PolicyName: CloudWatchLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLog
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: EFSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EFS
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:DescribeFileSystems
+                Resource:
+                  - !GetAtt EFSAccessPoint.Arn
+                  - !GetAtt EFSFileSystem.Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: streamlit-chatbot
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: streamlit
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/streamlit-chatbot:latest
+          PortMappings:
+            - ContainerPort: 8501
+          Environment:
+            - Name: STREAMLIT_SERVER_COOKIE_SECRET
+              Value: !Ref StreamlitServerCookieSecret
+          Essential: true
+          MountPoints:
+            - ContainerPath: /app/session_data
+              SourceVolume: streamlit-data
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      Volumes:
+        - Name: streamlit-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            AuthorizationConfig:
+              AccessPointId: !Ref EFSAccessPoint
+              IAM: ENABLED
+            TransitEncryption: ENABLED
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      ServiceName: streamlit-chatbot-service
+      # Only scaled up after first ECR push
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+      LoadBalancers:
+        - ContainerName: streamlit
+          ContainerPort: 8501
+          TargetGroupArn: !Ref TargetGroup
+      EnableExecuteCommand: true
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: streamlit-chatbot-alb
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+      Tags:
+        - Key: Name
+          Value: streamlit-chatbot-alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      LoadBalancerArns:
+        - !Ref LoadBalancer
+      VpcId: !Ref VpcId
+      Port: 8501
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 60
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: CreateDistruibution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt LoadBalancer.DNSName
+            Id: streamlit-chatbot-alb
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: streamlit-chatbot-alb
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Disabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+          ResponseHeadersPolicyId: e61eb60c-9c35-4d20-a928-2b84e02af89c  # CORS-and-SecurityHeadersPolicy
+          ViewerProtocolPolicy: redirect-to-https
+        PriceClass: PriceClass_All
+
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  'Fn::ForEach::EFSMountTarget':
+    - PrivateSubnetId
+    - !Ref PrivateSubnetIds
+    - EFSMountTarget&{PrivateSubnetId}:
+        Type: AWS::EFS::MountTarget
+        Properties:
+          FileSystemId: !Ref EFSFileSystem
+          SubnetId: !Ref PrivateSubnetId
+          SecurityGroups:
+            - !Ref EFSSecurityGroup
+
+  EFSAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: '999'
+          OwnerUid: '999'
+          Permissions: '755'
+        Path: /streamlit
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - !If
+          - CreateDistruibution
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            SourcePrefixListId: !FindInMap [AWSRegions2PrefixListID, !Ref 'AWS::Region', PrefixList]
+
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS traffic
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ECSTaskSecurityGroup

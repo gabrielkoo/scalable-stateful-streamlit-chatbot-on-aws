@@ -1,5 +1,9 @@
 # scalable-stateful-streamlit-chatbot-on-aws
 
+Most "Scalable" Streamlit solutions:
+- Doesn't cater for data persistency
+- If load balancing sticky sessions is not configured, it's possible that another node without the user session state is used to serve the user, resulting to errors.
+
 This is an example of a scalable and stateful Streamlit chatbot deployed on AWS, suing Application Load Balancer (ALB), Elastic Container Service (ECS on Fargate), and Elastic File System (EFS), and optionally CloudFront for CDN.
 
 Unlike a typical Streamlit app, this chatbot can remember the conversation history across user refreshes and server restarts, as well as it's scalable across multiple ECS nodes, without adding too much cost (with an exception of the fixed cost of ALB).
